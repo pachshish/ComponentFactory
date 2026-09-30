@@ -1,0 +1,51 @@
+# Create Secret component-factory-secrets separately with keys gitlab-token and api-key.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: component-factory
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: component-factory}
+  template:
+    metadata:
+      labels: {app: component-factory}
+    spec:
+      containers:
+        - name: api
+          image: YOUR_REGISTRY/component-factory:1.0
+          ports: [{containerPort: 8080}]
+          env:
+            - name: Factory__Token
+              valueFrom:
+                secretKeyRef: {name: component-factory-secrets, key: gitlab-token}
+            - name: Factory__ApiKey
+              valueFrom:
+                secretKeyRef: {name: component-factory-secrets, key: api-key}
+            - {name: Factory__GitLabUrl, value: 'https://gitlab.example.com'}
+            - {name: Factory__TemplateProjectId, value: '123'}
+            - {name: Factory__NamespaceId, value: '456'}
+            - {name: Factory__TemplateName, value: 'TemplateSensor'}
+          volumeMounts: [{name: work, mountPath: /tmp}]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: '1', memory: 512Mi}
+          readinessProbe:
+            httpGet: {path: /health, port: 8080}
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+      volumes:
+        - name: work
+          emptyDir: {sizeLimit: 2Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: component-factory
+spec:
+  selector: {app: component-factory}
+  ports: [{port: 8080, targetPort: 8080}]
