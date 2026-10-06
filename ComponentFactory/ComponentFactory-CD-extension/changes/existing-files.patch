@@ -1,0 +1,451 @@
+--- a/Application/Abstractions/IGitRepository.cs
++++ b/Application/Abstractions/IGitRepository.cs
+@@ -5,6 +5,12 @@
+ 
+ public interface IGitRepository
+ {
++    Task CloneAsync(
++        GitLabProject project,
++        IWorkspace workspace,
++        string branch,
++        CancellationToken cancellationToken);
++
+     Task CloneTemplateAsync(
+         GitLabProject template,
+         IWorkspace workspace,
+@@ -19,4 +25,21 @@
+         IWorkspace workspace,
+         GitLabProject target,
+         CancellationToken cancellationToken);
++
++    Task CommitAsync(
++        IWorkspace workspace,
++        string message,
++        string relativePath,
++        CancellationToken cancellationToken);
++
++    Task PushAsync(
++        IWorkspace workspace,
++        GitLabProject target,
++        string branch,
++        CancellationToken cancellationToken);
++
++    Task RefreshBranchAsync(
++        IWorkspace workspace,
++        string branch,
++        CancellationToken cancellationToken);
+ }
+--- a/Infrastructure/Git/GitRepository.cs
++++ b/Infrastructure/Git/GitRepository.cs
+@@ -5,17 +5,31 @@
+ 
+ namespace ComponentFactory.Infrastructure.Git;
+ 
+-public sealed class GitRepository(GitCommandRunner commands, RepositoryUrlValidator urls) : IGitRepository
++public sealed class GitRepository(GitCommandRunner commands, RepositoryUrlValidator urls, ILogger<GitRepository> logger) : IGitRepository
+ {
+     private readonly GitCommandRunner _commands = commands;
+     private readonly RepositoryUrlValidator _urls = urls;
++    private readonly ILogger<GitRepository> _logger = logger;
+ 
+-    public async Task CloneTemplateAsync(
++    public Task CloneTemplateAsync(
+         GitLabProject template,
+         IWorkspace workspace,
+         CancellationToken cancellationToken)
+     {
+-        _urls.Validate(template.RepositoryUrl);
++        return CloneAsync(template, workspace, RepositoryDefaults.Branch, cancellationToken);
++    }
++
++    public async Task CloneAsync(
++        GitLabProject project,
++        IWorkspace workspace,
++        string branch,
++        CancellationToken cancellationToken)
++    {
++        _urls.Validate(project.RepositoryUrl);
++        _logger.LogDebug("Cloning GitLab project {ProjectId} on branch {Branch}", project.Id, branch);
++        await _commands.RunAsync(
++            workspace.RootPath, workspace.AskPassPath, cancellationToken,
++            "check-ref-format", "--branch", branch);
+ 
+         await _commands.RunAsync(
+             workspace.RootPath,
+@@ -25,8 +39,9 @@
+             "--recurse-submodules",
+             "--depth", "1",
+             "--single-branch",
+-            "--branch", RepositoryDefaults.Branch,
+-            "--", template.RepositoryUrl, workspace.RepositoryPath);
++            "--branch", branch,
++            "--", project.RepositoryUrl, workspace.RepositoryPath);
++        _logger.LogDebug("Git clone completed for project {ProjectId} on branch {Branch}", project.Id, branch);
+     }
+ 
+     public async Task CreateInitialCommitAsync(
+@@ -34,6 +49,7 @@
+         ComponentName name,
+         CancellationToken cancellationToken)
+     {
++        _logger.LogDebug("Creating initial sensor commit for {Sensor}", name.Value);
+         if (Directory.Exists(Path.Combine(workspace.RepositoryPath, ".git")))
+         {
+             // Keep the Git index and submodule repositories; publish a root commit
+@@ -47,23 +63,64 @@
+         {
+             await RunInRepositoryAsync(workspace, cancellationToken, "init", $"--initial-branch={RepositoryDefaults.Branch}");
+         }
++        await CommitAsync(workspace, $"Initialize {name.Value} from component template", ".", cancellationToken);
++        await RunInRepositoryAsync(workspace, cancellationToken, "branch", "-M", RepositoryDefaults.Branch);
++    }
++
++    public async Task CommitAsync(
++        IWorkspace workspace,
++        string message,
++        string relativePath,
++        CancellationToken cancellationToken)
++    {
++        _logger.LogDebug("Staging Git changes under {RelativePath} and creating commit", relativePath);
+         await ConfigureCommitAuthorAsync(workspace, cancellationToken);
+-        await RunInRepositoryAsync(workspace, cancellationToken, "add", "--all");
+-        await RunInRepositoryAsync(workspace, cancellationToken, "commit", "-m", $"Initialize {name.Value} from component template");
+-        await RunInRepositoryAsync(workspace, cancellationToken, "branch", "-M", RepositoryDefaults.Branch);
++        await RunInRepositoryAsync(workspace, cancellationToken, "add", "--all", "--", relativePath);
++        await RunInRepositoryAsync(workspace, cancellationToken, "commit", "-m", message);
++        _logger.LogDebug("Git commit completed for path {RelativePath}", relativePath);
++    }
++
++    public Task PushAsync(
++        IWorkspace workspace,
++        GitLabProject target,
++        CancellationToken cancellationToken)
++    {
++        return PushAsync(workspace, target, RepositoryDefaults.Branch, cancellationToken);
+     }
+ 
+     public async Task PushAsync(
+         IWorkspace workspace,
+         GitLabProject target,
++        string branch,
+         CancellationToken cancellationToken)
+     {
+         _urls.Validate(target.RepositoryUrl);
++        _logger.LogDebug("Pushing GitLab project {ProjectId} to branch {Branch}", target.Id, branch);
+ 
+         // A cloned repository already has origin. This also works for a fresh
+         // repository, where setting this key creates the remote configuration.
+         await RunInRepositoryAsync(workspace, cancellationToken, "config", "remote.origin.url", target.RepositoryUrl);
+-        await RunInRepositoryAsync(workspace, cancellationToken, "push", "--set-upstream", "origin", RepositoryDefaults.Branch);
++        await RunInRepositoryAsync(workspace, cancellationToken, "push", "--set-upstream", "origin", $"HEAD:refs/heads/{branch}");
++        _logger.LogDebug("Git push completed for project {ProjectId} on branch {Branch}", target.Id, branch);
++    }
++
++    public async Task RefreshBranchAsync(
++        IWorkspace workspace,
++        string branch,
++        CancellationToken cancellationToken)
++    {
++        _logger.LogInformation("Fetching latest remote branch {Branch} before rebasing the local CD commit", branch);
++        // A shallow clone needs the intervening history for a reliable rebase.
++        var arguments = new List<string> { "fetch", "--no-recurse-submodules" };
++        if (File.Exists(Path.Combine(workspace.RepositoryPath, ".git", "shallow")))
++        {
++            arguments.Add("--unshallow");
++        }
++        arguments.AddRange(["origin", branch]);
++        await RunInRepositoryAsync(workspace, cancellationToken, arguments.ToArray());
++        _logger.LogInformation("Fetch completed for {Branch}; starting rebase onto FETCH_HEAD", branch);
++        await RunInRepositoryAsync(workspace, cancellationToken, "rebase", "FETCH_HEAD");
++        _logger.LogInformation("Rebase completed for {Branch}", branch);
+     }
+ 
+     private async Task ConfigureCommitAuthorAsync(
+--- a/Infrastructure/Git/GitCommandRunner.cs
++++ b/Infrastructure/Git/GitCommandRunner.cs
+@@ -1,13 +1,15 @@
+ using System.Diagnostics;
++using System.Text.RegularExpressions;
+ using ComponentFactory.Configuration;
+ using ComponentFactory.Domain;
+ using Microsoft.Extensions.Options;
+ 
+ namespace ComponentFactory.Infrastructure.Git;
+ 
+-public sealed class GitCommandRunner(IOptions<FactoryOptions> options)
++public sealed class GitCommandRunner(IOptions<FactoryOptions> options, ILogger<GitCommandRunner> logger)
+ {
+     private readonly FactoryOptions _options = options.Value;
++    private readonly ILogger<GitCommandRunner> _logger = logger;
+ 
+     public async Task RunAsync(
+         string workingDirectory,
+@@ -15,21 +17,60 @@
+         CancellationToken cancellationToken,
+         params string[] arguments)
+     {
++        if (arguments.Length == 0)
++        {
++            throw new ArgumentException("A Git operation is required.", nameof(arguments));
++        }
++        cancellationToken.ThrowIfCancellationRequested();
++        var operation = SanitizeDiagnostic(arguments[0]);
++        var timer = Stopwatch.StartNew();
++        _logger.LogDebug("Starting Git operation {Operation}", operation);
+         var startInfo = CreateStartInfo(workingDirectory, askPassPath, arguments);
+ 
+-        using var process = Process.Start(startInfo)
+-            ?? throw CommandFailure(arguments[0]);
++        Process process;
++        try
++        {
++            process = Process.Start(startInfo) ?? throw new InvalidOperationException("The Git process could not be started.");
++        }
++        catch (Exception exception)
++        {
++            var details = SanitizeDiagnostic(exception.Message);
++            _logger.LogError("Git operation {Operation} could not start: {Details}", operation, details);
++            throw CommandFailure(operation, details);
++        }
+ 
+-        // Drain both pipes concurrently so Git cannot block on a full output buffer.
+-        var standardOutput = process.StandardOutput.ReadToEndAsync();
+-        var standardError = process.StandardError.ReadToEndAsync();
++        using (process)
++        {
++            // Drain both pipes concurrently so Git cannot block on a full output buffer.
++            var standardOutput = process.StandardOutput.ReadToEndAsync();
++            var standardError = process.StandardError.ReadToEndAsync();
+ 
+-        await WaitForExitAsync(process, standardOutput, standardError, cancellationToken);
++            try
++            {
++                await WaitForExitAsync(process, standardOutput, standardError, cancellationToken);
++            }
++            catch (OperationCanceledException)
++            {
++                _logger.LogWarning("Git operation {Operation} was cancelled or timed out after {ElapsedMs} ms", operation, timer.ElapsedMilliseconds);
++                throw;
++            }
+ 
+-        if (process.ExitCode != 0)
+-        {
+-            // Raw Git output may contain credentials or private repository details.
+-            throw CommandFailure(arguments[0]);
++            if (process.ExitCode != 0)
++            {
++                // Keep useful diagnostics in the log and exception chain, after
++                // removing configured credentials and URL/header credentials.
++                var details = SanitizeDiagnostic(await standardError);
++                if (string.IsNullOrWhiteSpace(details))
++                {
++                    details = "Git returned no stderr output.";
++                }
++                _logger.LogError(
++                    "Git operation {Operation} failed with exit code {ExitCode} after {ElapsedMs} ms; GitError={GitError}",
++                    operation, process.ExitCode, timer.ElapsedMilliseconds, details);
++                throw CommandFailure(operation, $"Git exit code {process.ExitCode}: {details}");
++            }
++
++            _logger.LogDebug("Git operation {Operation} completed in {ElapsedMs} ms", operation, timer.ElapsedMilliseconds);
+         }
+     }
+ 
+@@ -101,10 +142,31 @@
+         await Task.WhenAll(standardOutput, standardError);
+     }
+ 
+-    private static ComponentFactoryException CommandFailure(string operation)
++    private string SanitizeDiagnostic(string text)
++    {
++        foreach (var secret in new[] { _options.Token, _options.ApiKey }
++            .Where(value => !string.IsNullOrWhiteSpace(value))
++            .OrderByDescending(value => value.Length))
++        {
++            text = text.Replace(secret, "[REDACTED]", StringComparison.Ordinal);
++        }
++        text = Regex.Replace(text, @"(?<scheme>[a-z][a-z0-9+.-]*://)[^\s/]*@", "${scheme}[REDACTED]@", RegexOptions.IgnoreCase);
++        text = Regex.Replace(text,
++            @"(?<header>Authorization\s*:\s*)(?:Basic|Bearer)\s+[^\s]+",
++            "${header}[REDACTED]", RegexOptions.IgnoreCase);
++        text = Regex.Replace(text,
++            @"(?<key>PRIVATE-TOKEN|X-Api-Key|access_token|private_token)(?<separator>\s*[:=]\s*)[^\s&]+",
++            "${key}${separator}[REDACTED]", RegexOptions.IgnoreCase);
++
++        const int maxCharacters = 4000;
++        return text.Length <= maxCharacters ? text : text[..maxCharacters] + " [truncated]";
++    }
++
++    private static ComponentFactoryException CommandFailure(string operation, string details)
+     {
+         return new ComponentFactoryException(
+             FactoryError.ExternalOperationFailed,
+-            $"Git operation '{operation}' failed.");
++            $"Git operation '{operation}' failed.",
++            innerException: new InvalidOperationException(details));
+     }
+ }
+--- a/Application/Abstractions/ITemplateCustomizer.cs
++++ b/Application/Abstractions/ITemplateCustomizer.cs
+@@ -8,4 +8,10 @@
+         string repositoryPath,
+         ComponentName name,
+         CancellationToken cancellationToken);
++
++    Task CustomizeAsync(
++        string rootPath,
++        ComponentName name,
++        string templateName,
++        CancellationToken cancellationToken);
+ }
+--- a/Infrastructure/Templates/TemplateCustomizer.cs
++++ b/Infrastructure/Templates/TemplateCustomizer.cs
+@@ -10,20 +10,33 @@
+     TemplateScanner scanner,
+     Utf8TextRewriter textRewriter,
+     IOptions<FactoryOptions> options,
+-    GitCommandRunner commands) : ITemplateCustomizer
++    GitCommandRunner commands,
++    ILogger<TemplateCustomizer> logger) : ITemplateCustomizer
+ {
+     private readonly TemplateScanner _scanner = scanner;
+     private readonly Utf8TextRewriter _textRewriter = textRewriter;
+     private readonly string _templateName = options.Value.TemplateName;
+     private readonly GitCommandRunner _commands = commands;
++    private readonly ILogger<TemplateCustomizer> _logger = logger;
++
++    public Task CustomizeAsync(
++        string repositoryPath,
++        ComponentName name,
++        CancellationToken cancellationToken)
++    {
++        return CustomizeAsync(repositoryPath, name, _templateName, cancellationToken);
++    }
+ 
+     public async Task CustomizeAsync(
+         string repositoryPath,
+         ComponentName name,
++        string templateName,
+         CancellationToken cancellationToken)
+     {
++        _logger.LogDebug("Customizing template {TemplateName} for {Sensor} under {RootPath}", templateName, name.Value, repositoryPath);
+         var entries = _scanner.Scan(repositoryPath, cancellationToken, out var submodulePaths);
+-        var replacement = new NameReplacement(_templateName, name);
++        _logger.LogDebug("Template scan found {EntryCount} entries; preserving {SubmoduleCount} submodule roots", entries.Count, submodulePaths.Count);
++        var replacement = new NameReplacement(templateName, name);
+         var renamePlan = RenamePlan.Create(repositoryPath, entries, replacement, submodulePaths);
+ 
+         await RewriteFileContentsAsync(entries, replacement, cancellationToken);
+@@ -46,6 +59,7 @@
+         {
+             await renamePlan.ApplyAsync(cancellationToken);
+         }
++        _logger.LogDebug("Template customization completed for {Sensor} under {RootPath}", name.Value, repositoryPath);
+     }
+ 
+     private async Task RewriteFileContentsAsync(
+--- a/Application/ComponentGenerator.cs
++++ b/Application/ComponentGenerator.cs
+@@ -11,6 +11,7 @@
+     IGitRepository repository,
+     ITemplateCustomizer customizer,
+     IWorkspaceFactory workspaces,
++    ICdProvisioner cdProvisioner,
+     IOptions<FactoryOptions> options,
+     ILogger<ComponentGenerator> logger) : IComponentGenerator
+ {
+@@ -18,6 +19,7 @@
+     private readonly IGitRepository _repository = repository;
+     private readonly ITemplateCustomizer _customizer = customizer;
+     private readonly IWorkspaceFactory _workspaces = workspaces;
++    private readonly ICdProvisioner _cdProvisioner = cdProvisioner;
+     private readonly FactoryOptions _options = options.Value;
+     private readonly ILogger<ComponentGenerator> _logger = logger;
+ 
+@@ -43,6 +45,8 @@
+             operationToken);
+ 
+         await PushToCreatedProjectAsync(workspace, project, operationToken);
++
++        await ProvisionCdAsync(name, project, operationToken);
+ 
+         return new GeneratedComponent(
+             project.Id,
+@@ -74,6 +78,32 @@
+         await _repository.CreateInitialCommitAsync(workspace, name, cancellationToken);
+     }
+ 
++    private async Task ProvisionCdAsync(
++        ComponentName name,
++        GitLabProject project,
++        CancellationToken cancellationToken)
++    {
++        _logger.LogInformation("Sensor {Sensor} was created and pushed at {ProjectUrl}; starting CD provisioning", name.Value, project.WebUrl);
++        try
++        {
++            await _cdProvisioner.ProvisionAsync(name, cancellationToken);
++            _logger.LogInformation("Sensor {Sensor} and its CD files were published successfully; returning response", name.Value);
++        }
++        catch (Exception exception)
++        {
++            var stage = (exception as ComponentFactoryException)?.Stage ?? "cd-prepare";
++            _logger.LogError(exception, "Sensor project {ProjectId} was published, but CD provisioning failed at {Stage}", project.Id, stage);
++
++            throw new ComponentFactoryException(
++                FactoryError.GenerationIncomplete,
++                $"Sensor '{name.Value}' was created and pushed, but CD provisioning failed at '{stage}'. " +
++                "The sensor project was retained. Check the logs before retrying; the sensor already exists.",
++                project.WebUrl,
++                stage,
++                exception);
++        }
++    }
++
+     private async Task PushToCreatedProjectAsync(
+         IWorkspace workspace,
+         GitLabProject project,
+--- a/Configuration/ServiceCollectionExtensions.cs
++++ b/Configuration/ServiceCollectionExtensions.cs
+@@ -1,6 +1,7 @@
+ using ComponentFactory.Api;
+ using ComponentFactory.Application;
+ using ComponentFactory.Application.Abstractions;
++using ComponentFactory.Infrastructure.Cd;
+ using ComponentFactory.Infrastructure.Git;
+ using ComponentFactory.Infrastructure.GitLab;
+ using ComponentFactory.Infrastructure.Templates;
+@@ -32,6 +33,11 @@
+         services.AddOptions<FactoryOptions>()
+             .BindConfiguration(FactoryOptions.SectionName)
+             .ValidateOnStart();
++
++        services.AddSingleton<IValidateOptions<CdOptions>, CdOptionsValidator>();
++        services.AddOptions<CdOptions>()
++            .BindConfiguration(CdOptions.SectionName)
++            .ValidateOnStart();
+     }
+ 
+     private static void AddGitLabClient(IServiceCollection services)
+@@ -55,6 +61,7 @@
+     private static void AddGenerationServices(IServiceCollection services)
+     {
+         services.AddTransient<IComponentGenerator, ComponentGenerator>();
++        services.AddTransient<ICdProvisioner, CdProvisioner>();
+         services.AddTransient<IGitRepository, GitRepository>();
+         services.AddTransient<ITemplateCustomizer, TemplateCustomizer>();
+         services.AddTransient<IWorkspaceFactory, WorkspaceFactory>();
+--- a/appsettings.json
++++ b/appsettings.json
+@@ -6,5 +6,12 @@
+     "TemplateName": "TemplateSensor",
+     "WorkRoot": "/tmp/component-factory",
+     "OperationTimeoutSeconds": 300
++  },
++  "Cd": {
++    "ProjectId": 0,
++    "Branch": "master",
++    "TemplatePath": "sensorgates/senortemplate",
++    "TargetRoot": "sensorgates",
++    "TemplateName": "SenorTemplate"
+   }
+ }

@@ -1,0 +1,9 @@
+{
+  "Cd": {
+    "ProjectId": 0,
+    "Branch": "master",
+    "TemplatePath": "sensorgates/senortemplate",
+    "TargetRoot": "sensorgates",
+    "TemplateName": "SenorTemplate"
+  }
+}
